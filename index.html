@@ -267,6 +267,19 @@ window.dispatchEvent(new Event('mpReady'));
     display: flex;
     justify-content: space-between;
   }
+  /* ---- Hand-drawn (stepped) mode ---- */
+body.stepped #puppet-wrap,
+body.stepped #body-wrap,
+body.stepped #tilt-wrap,
+body.stepped #head-wrap,
+body.stepped .pupils {
+  transition: none;
+}
+/* The breathing bob is driven from JS in this mode so it snaps on the same clock */
+body.stepped #stage.bobbing #body-wrap,
+body.stepped #stage.bobbing #head-wrap {
+  animation: none;
+}
 </style>
 </head>
 <body>
@@ -341,6 +354,21 @@ window.dispatchEvent(new Event('mpReady'));
         </div>
       </div>
 
+      <div class="menuSection">
+  <div class="menuSectionTitle">Animation style</div>
+  <label class="menuRow">
+    <input type="checkbox" id="toggleStepped">
+    Hand-drawn mode
+  </label>
+  <label class="menuRow">
+    Frame rate
+    <select id="steppedFps">
+      <option value="8">8 fps</option>
+      <option value="12" selected>12 fps</option>
+      <option value="24">24 fps</option>
+    </select>
+  </label>
+</div>
       <div class="menuSection">
         <div class="menuSectionTitle">Idle animations</div>
         <label class="menuRow">
@@ -479,12 +507,28 @@ window.dispatchEvent(new Event('mpReady'));
   const blinkLayers = buildLayerMap('blink', 'dir');
   const mouthLayers = buildLayerMap('mouth', 'frame');
 
-  function setActive(map, key) {
-    const keyStr = key === null ? null : String(key);
-    Object.entries(map).forEach(([k, el]) => {
-      el.classList.toggle('shown', k === keyStr);
-    });
+  // ---- Stepped-mode plumbing ----
+// In stepped mode, visual changes are queued here and applied together
+// on a fixed frame clock instead of immediately.
+let steppedMode = false;
+let steppedFps = 12;
+const pendingActive = new Map(); // layer map -> key to show
+let eyeDirty = false, leanDirty = false, tiltDirty = false;
+
+function applyActive(map, keyStr) {
+  Object.entries(map).forEach(([k, el]) => {
+    el.classList.toggle('shown', k === keyStr);
+  });
+}
+
+function setActive(map, key) {
+  const keyStr = key === null ? null : String(key);
+  if (steppedMode) {
+    pendingActive.set(map, keyStr);
+    return;
   }
+  applyActive(map, keyStr);
+}
 
   let currentDirection = 'front'; // 'front' | 'left' | 'right'
   let blinkVisible = false; // true while the blink overlay is currently shown
@@ -681,14 +725,19 @@ window.dispatchEvent(new Event('mpReady'));
 
   let idleEyeEnabled = false;
 
-  function updateEyeTransform() {
-    Object.entries(pupilLayers).forEach(([dir, el]) => {
-      const base = EYE_BASE_OFFSET[dir] || { x: 0, y: 0 };
-      const x = base.x + glanceOffset.x;
-      const y = base.y + glanceOffset.y;
-      el.style.transform = `translate(${x}%, ${y}%)`;
-    });
-  }
+  function doUpdateEyeTransform() {
+  Object.entries(pupilLayers).forEach(([dir, el]) => {
+    const base = EYE_BASE_OFFSET[dir] || { x: 0, y: 0 };
+    const x = base.x + glanceOffset.x;
+    const y = base.y + glanceOffset.y;
+    el.style.transform = `translate(${x}%, ${y}%)`;
+  });
+}
+
+function updateEyeTransform() {
+  if (steppedMode) { eyeDirty = true; return; }
+  doUpdateEyeTransform();
+}
 
   function scheduleNextGlance() {
     const delayBeforeGlance = 2000 + Math.random() * 4000; // 2-6s of looking straight
@@ -1027,6 +1076,18 @@ window.dispatchEvent(new Event('mpReady'));
     applyBackground();
   });
 
+  clearBgImage.addEventListener('click', () => {
+    if (bgImageURL) {
+      URL.revokeObjectURL(bgImageURL);
+      bgImageURL = null;
+    }
+
+    bgImagePicker.value = '';
+    bgImageName.textContent = '';
+    clearBgImage.style.display = 'none';
+    applyBackground();
+  });
+
   // ---- Webcam / face tracking ----
   // Uses MediaPipe FaceLandmarker (loaded as an ES module above).
   // Drives head direction and mouth-open the same way manual keys do —
@@ -1095,6 +1156,7 @@ window.dispatchEvent(new Event('mpReady'));
     camMouthSliderWrap.style.display = camMouthEnabled ? 'flex' : 'none';
     if (!camMouthEnabled) {
       camMouthOpen = false;
+      camMouthWide = false;
       updateHeadLayer();
     }
   });
@@ -1125,9 +1187,23 @@ window.dispatchEvent(new Event('mpReady'));
     }
   });
 
-  function applyLean(deg) {
-    puppetWrapEl.style.transform = deg === 0 ? '' : `rotate(${deg}deg)`;
-  }
+  function doApplyLean() {
+  puppetWrapEl.style.transform = camLeanDeg === 0 ? '' : `rotate(${camLeanDeg}deg)`;
+}
+function applyLean(deg) {
+  if (steppedMode) { leanDirty = true; return; }
+  doApplyLean();
+}
+
+function doApplyHeadTilt() {
+  // Subtract lean so the head stays upright when the body leans
+  const compensated = camTiltDeg - camLeanDeg;
+  headWrapEl.style.transform = compensated === 0 ? '' : `rotate(${compensated}deg)`;
+}
+function applyHeadTilt(deg) {
+  if (steppedMode) { tiltDirty = true; return; }
+  doApplyHeadTilt();
+}
 
   camYawSlider.addEventListener('input', () => {
     camYawThreshold = Number(camYawSlider.value);
@@ -1252,14 +1328,6 @@ window.dispatchEvent(new Event('mpReady'));
     camStatusEl.textContent = 'Tracking active';
     if (camPreviewToggle.checked) camFloatPreview.style.display = 'block';
     requestAnimationFrame(camLoop);
-  }
-
-  function applyHeadTilt(deg) {
-    // Subtract the current lean angle so the head stays visually upright
-    // when the body leans. Without this, a left lean also visually tilts
-    // the head left since tilt-wrap is inside puppet-wrap.
-    const compensated = deg - camLeanDeg;
-    headWrapEl.style.transform = compensated === 0 ? '' : `rotate(${compensated}deg)`;
   }
 
   function disableCam() {
@@ -1639,6 +1707,10 @@ window.dispatchEvent(new Event('mpReady'));
           camMouthOpen = false;
           updateHeadLayer();
         }
+        if (camMouthWide) {
+          camMouthWide = false;
+          updateHeadLayer();
+        }
         if (camTiltDeg !== 0) {
           camTiltDeg = 0;
           applyHeadTilt(0);
@@ -1664,6 +1736,77 @@ window.dispatchEvent(new Event('mpReady'));
 
     requestAnimationFrame(camLoop);
   }
+  // ---- Hand-drawn (stepped) mode ----
+const bodyWrapEl = document.getElementById('body-wrap');
+const headBobEl  = document.getElementById('head-wrap');
+const steppedToggle = document.getElementById('toggleStepped');
+const steppedFpsSelect = document.getElementById('steppedFps');
+
+// Same shape as the CSS bob: rise, hold, fall, with ease-in-out on each leg
+function easeInOut(t) {
+  return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+}
+function bobOffset(timeSec, delaySec, amp) {
+  const T = 3.8;
+  const p = ((((timeSec - delaySec) % T) + T) % T) / T;
+  if (p < 0.4) return -amp * easeInOut(p / 0.4);
+  if (p < 0.6) return -amp;
+  return -amp * (1 - easeInOut((p - 0.6) / 0.4));
+}
+
+function flushFrame() {
+  pendingActive.forEach((key, map) => applyActive(map, key));
+  pendingActive.clear();
+
+  if (eyeDirty)  { doUpdateEyeTransform(); eyeDirty = false; }
+  if (leanDirty) { doApplyLean();          leanDirty = false; }
+  if (tiltDirty) { doApplyHeadTilt();      tiltDirty = false; }
+
+  if (stageEl.classList.contains('bobbing')) {
+    const t = performance.now() / 1000;
+    bodyWrapEl.style.transform = `translateY(${bobOffset(t, 0, 8)}px)`;
+    headBobEl.style.transform  = `translateY(${bobOffset(t, 0.3, 6)}px)`;
+  } else {
+    bodyWrapEl.style.transform = '';
+    headBobEl.style.transform  = '';
+  }
+}
+
+let lastFrameTime = 0;
+function steppedLoop(now) {
+  if (!steppedMode) return;
+  const interval = 1000 / steppedFps;
+  const elapsed = now - lastFrameTime;
+  if (elapsed >= interval) {
+    lastFrameTime = now - (elapsed % interval);
+    flushFrame();
+  }
+  requestAnimationFrame(steppedLoop);
+}
+
+steppedFpsSelect.addEventListener('change', () => {
+  steppedFps = Number(steppedFpsSelect.value);
+});
+
+steppedToggle.addEventListener('change', () => {
+  steppedMode = steppedToggle.checked;
+  document.body.classList.toggle('stepped', steppedMode);
+
+  if (steppedMode) {
+    lastFrameTime = 0;
+    requestAnimationFrame(steppedLoop);
+  } else {
+    // Sync everything back to the live state and hand control back to CSS
+    pendingActive.forEach((key, map) => applyActive(map, key));
+    pendingActive.clear();
+    eyeDirty = leanDirty = tiltDirty = false;
+    doUpdateEyeTransform();
+    doApplyLean();
+    doApplyHeadTilt();
+    bodyWrapEl.style.transform = '';
+    headBobEl.style.transform = '';
+  }
+});
 </script>
 
 </body>
